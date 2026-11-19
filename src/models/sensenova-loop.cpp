@@ -1,7 +1,9 @@
 #include "models.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 void llama_model_sensenova_loop::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, true);
@@ -157,6 +159,53 @@ void llama_model_sensenova_loop::graph::build_merge(
     b = ggml_add(ctx0, next_b, ggml_mul(ctx0, branch, route.post[1]));
 }
 
+// LLAMA_SENSENOVA_MHC_FUSED=0 selects the unfused mHC graph
+static bool sensenova_mhc_fused() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_SENSENOVA_MHC_FUSED");
+        return env == nullptr || std::string(env) != "0";
+    }();
+    return enabled;
+}
+
+ggml_tensor * llama_model_sensenova_loop::graph::build_route_fused(
+        ggml_tensor * hc, ggml_tensor * weight, ggml_tensor * bias, int il) {
+    // same memory layout as concat(a, b, 0)
+    ggml_tensor * flat = ggml_reshape_2d(ctx0, hc, 2*hc->ne[0], hc->ne[2]);
+    if (loras->empty() && build_hadamard_input(weight, flat) == flat) {
+        // rms_norm, router matmul, bias and route in one op
+        ggml_tensor * route = ggml_mhc_route_ext(ctx0, flat, weight, bias, 1e-6f, 2.0f, (int32_t) hparams.mhc_iterations);
+        cb(route, "mhc_route", il);
+        return route;
+    }
+    flat = ggml_rms_norm(ctx0, flat, 1e-6f);
+    ggml_tensor * logits = build_lora_mm(weight, flat);
+    if (logits->op == GGML_OP_MUL_MAT) {
+        ggml_prec_set_acc(logits, GGML_PREC_F32);
+        ggml_prec_set_src(logits, GGML_PREC_F32, 1);
+    }
+    logits = ggml_add(ctx0, logits, bias);
+    ggml_tensor * route = ggml_mhc_route(ctx0, logits, 2.0f, (int32_t) hparams.mhc_iterations);
+    cb(route, "mhc_route", il);
+    return route;
+}
+
+ggml_tensor * llama_model_sensenova_loop::graph::build_mhc_input(ggml_tensor * hc, ggml_tensor * route, int il) {
+    ggml_tensor * pre = ggml_view_2d(ctx0, route, 2, route->ne[1], route->nb[1], 0);
+    ggml_tensor * input = ggml_dsv4_hc_pre(ctx0, hc, pre);
+    if (hparams.mhc_pre_scale != 1.0f) {
+        input = ggml_scale(ctx0, input, hparams.mhc_pre_scale);
+    }
+    cb(input, "mhc_input", il);
+    return input;
+}
+
+ggml_tensor * llama_model_sensenova_loop::graph::build_mhc_merge(ggml_tensor * hc, ggml_tensor * branch, ggml_tensor * route) {
+    ggml_tensor * post = ggml_view_2d(ctx0, route, 2, route->ne[1], route->nb[1], 2*route->nb[0]);
+    ggml_tensor * comb = ggml_view_3d(ctx0, route, 2, 2, route->ne[1], 2*route->nb[0], route->nb[1], 4*route->nb[0]);
+    return ggml_dsv4_hc_post(ctx0, branch, hc, post, comb);
+}
+
 llama_model_sensenova_loop::graph::graph(const llm_graph_params & params) : graph_base(params) {
     const auto & loop = static_cast<const llama_model_sensenova_loop &>(model);
     auto * inp = build_inp_mem_hybrid();
@@ -165,12 +214,51 @@ llama_model_sensenova_loop::graph::graph(const llm_graph_params & params) : grap
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     ggml_tensor * a = nullptr;
     ggml_tensor * b = nullptr;
+    ggml_tensor * hc = nullptr;
+    const bool fused = !hparams.mhc_fixed_identity && sensenova_mhc_fused();
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
         const uint32_t physical = loop.physical_layer(il);
         const bool mhc = physical >= hparams.mhc_start && physical < hparams.mhc_end;
         res->t_layer_inp[il] = cur;
+        if (mhc && fused) {
+            if (physical == hparams.mhc_start) {
+                ggml_tensor * c = ggml_reshape_3d(ctx0, cur, n_embd, 1, cur->ne[1]);
+                hc = ggml_concat(ctx0, c, c, 1);
+            }
+            ggml_tensor * route = build_route_fused(hc, layer.hc_attn_fn, layer.hc_attn_fn_b, il);
+            cur = build_norm(build_mhc_input(hc, route, il), layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+            if (hparams.is_recr(il)) {
+                cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+            } else {
+                cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
+            }
+            if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
+                cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+                route = ggml_get_rows(ctx0, route, inp_out_ids);
+                hc    = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hc, 2*n_embd, hc->ne[2]), inp_out_ids);
+                hc    = ggml_reshape_3d(ctx0, hc, n_embd, 2, hc->ne[1]);
+            }
+            hc = build_mhc_merge(hc, cur, route);
+            route = build_route_fused(hc, layer.hc_ffn_fn, layer.hc_ffn_fn_b, il);
+            cur = build_norm(build_mhc_input(hc, route, il), layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
+            cur = build_layer_ffn(cur, il);
+            hc = build_mhc_merge(hc, cur, route);
+
+            ggml_tensor * s0 = ggml_view_2d(ctx0, hc, n_embd, hc->ne[2], hc->nb[2], 0);
+            ggml_tensor * s1 = ggml_view_2d(ctx0, hc, n_embd, hc->ne[2], hc->nb[2], hc->nb[1]);
+            ggml_tensor * v0 = build_cvec(s0, il);
+            ggml_tensor * v1 = build_cvec(s1, il);
+            if (v0 != s0 || v1 != s1) {
+                hc = ggml_concat(ctx0,
+                        ggml_reshape_3d(ctx0, ggml_cont(ctx0, v0), n_embd, 1, v0->ne[1]),
+                        ggml_reshape_3d(ctx0, ggml_cont(ctx0, v1), n_embd, 1, v1->ne[1]), 1);
+            }
+            cur = ggml_scale(ctx0, ggml_add(ctx0, v0, v1), 0.5f);
+            cb(cur, "l_out", il);
+            continue;
+        }
         if (mhc && physical == hparams.mhc_start) {
             a = cur;
             b = cur;

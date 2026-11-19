@@ -2726,6 +2726,11 @@ struct llama_model_sensenova_loop : public llama_model_qwen35 {
 
         routing build_route(ggml_tensor * a, ggml_tensor * b, ggml_tensor * weight, ggml_tensor * bias, int il);
         void build_merge(ggml_tensor * & a, ggml_tensor * & b, ggml_tensor * branch, const routing & route);
+
+        // fused path: both streams in one [n_embd, 2, n_tokens] tensor
+        ggml_tensor * build_route_fused(ggml_tensor * hc, ggml_tensor * weight, ggml_tensor * bias, int il);
+        ggml_tensor * build_mhc_input(ggml_tensor * hc, ggml_tensor * route, int il);
+        ggml_tensor * build_mhc_merge(ggml_tensor * hc, ggml_tensor * branch, ggml_tensor * route);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
