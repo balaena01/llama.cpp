@@ -4,6 +4,8 @@ This branch runs [SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-
 
 **Result: 9.2 tok/s generation (108 ms/token), all layers on the PS4 GPU**, with the same quality as the official Q4_K_M (wikitext-2 perplexity 14.84 vs 14.87).
 
+Model: [Kujira/SenseNova-Loop-9B-IQ4_NL-PS4-GGUF](https://huggingface.co/Kujira/SenseNova-Loop-9B-IQ4_NL-PS4-GGUF)
+
 日本語の詳しい作業記録は [WORKFLOW_ja.md](WORKFLOW_ja.md) にあります。
 
 ## Speed progression
@@ -64,7 +66,7 @@ This branch runs [SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-
 
 2. **Build** (`scripts/build_sensenova.sh`): Vulkan on, `-DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF`. A full build takes about 20 minutes on the Jaguar CPU.
 
-3. **Model**: download the official BF16 GGUF and quantize on the PS4 (`scripts/run_imatrix.sh`, `scripts/quantize_iq4nl_c.sh`):
+3. **Model**: the quantized file is on Hugging Face: [Kujira/SenseNova-Loop-9B-IQ4_NL-PS4-GGUF](https://huggingface.co/Kujira/SenseNova-Loop-9B-IQ4_NL-PS4-GGUF). To make it yourself, download the official BF16 GGUF and quantize on the PS4 (`scripts/run_imatrix.sh`, `scripts/quantize_iq4nl_c.sh`):
 
    ```sh
    llama-quantize --imatrix imatrix-sn-loop.gguf \
