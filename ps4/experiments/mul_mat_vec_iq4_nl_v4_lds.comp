@@ -1,0 +1,140 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// dedicated iq4_nl mat-vec for GPUs where each vector memory instruction is expensive (GCN):
+// a 16-block row segment (288 bytes) is staged in shared memory with coalesced 16-byte loads,
+// then each thread reads its d and qs from shared memory
+
+layout (binding = 0) readonly buffer A_UV4 {uvec4 data_a_uv4[];};
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+shared uint a_seg[NUM_ROWS * 72];
+
+// w holds 4 qs bytes: the low nibble of byte k is weight k (blo), the high nibble is weight k+16 (bhi)
+FLOAT_TYPE dot8(const uint w, const vec4 blo, const vec4 bhi) {
+    FLOAT_TYPE s = blo.x * kvalues_iq4nl[w & 0xF];
+    s = fma(blo.y, kvalues_iq4nl[(w >>  8) & 0xF], s);
+    s = fma(blo.z, kvalues_iq4nl[(w >> 16) & 0xF], s);
+    s = fma(blo.w, kvalues_iq4nl[(w >> 24) & 0xF], s);
+    s = fma(bhi.x, kvalues_iq4nl[(w >>  4) & 0xF], s);
+    s = fma(bhi.y, kvalues_iq4nl[(w >> 12) & 0xF], s);
+    s = fma(bhi.z, kvalues_iq4nl[(w >> 20) & 0xF], s);
+    s = fma(bhi.w, kvalues_iq4nl[ w >> 28], s);
+    return s;
+}
+
+// fallback: one block per thread with 16-bit loads
+void calc_block(const uint a_offset, const uint b_offset, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        if (n < num_rows) {
+            const uint ib = a_offset + (first_row + n) * num_blocks_per_row + i;
+            const FLOAT_TYPE d = FLOAT_TYPE(data_a_packed16[ib].d);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                FLOAT_TYPE s = FLOAT_TYPE(0);
+                [[unroll]] for (uint k = 0; k < 4; ++k) {
+                    const uint w = uint(data_a_packed16[ib].qs[2 * k]) | (uint(data_a_packed16[ib].qs[2 * k + 1]) << 16);
+                    const uint bi = j*p.batch_stride_b + b_offset + 32 * i + 4 * k;
+                    const vec4 blo = vec4(data_b[bi], data_b[bi + 1], data_b[bi + 2], data_b[bi + 3]);
+                    const vec4 bhi = vec4(data_b[bi + 16], data_b[bi + 17], data_b[bi + 18], data_b[bi + 19]);
+                    s += dot8(w, blo, bhi);
+                }
+                temp[j][n] = fma(d, s, temp[j][n]);
+            }
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_offset, b_offset, d_offset;
+
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+    const uint tid = gl_LocalInvocationID.x;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    const uint row_base = a_offset + first_row * num_blocks_per_row;
+    // segments must be 16-byte aligned: 8 blocks are 144 bytes
+    const bool fast = gl_WorkGroupSize.x == 64 && (num_blocks_per_row % 16) == 0 && (row_base % 8) == 0 &&
+                      (b_offset % 4) == 0 && (p.batch_stride_b % 4) == 0;
+
+    if (fast) {
+        const uint blk = tid / 4; // block in the segment
+        const uint k   = tid % 4; // qs dword in the block
+        const uint num_segs = num_blocks_per_row / 16;
+
+        for (uint s = 0; s < num_segs; ++s) {
+            barrier();
+            [[unroll]] for (uint q0 = 0; q0 < NUM_ROWS * 18; q0 += 64) {
+                const uint q = q0 + tid;
+                if (q < NUM_ROWS * 18) {
+                    const uint n  = q / 18;
+                    const uint qq = q % 18;
+                    if (n < num_rows) {
+                        const uvec4 v = data_a_uv4[((row_base + n * num_blocks_per_row) * 18 + s * 288) / 16 + qq];
+                        a_seg[4 * q + 0] = v.x;
+                        a_seg[4 * q + 1] = v.y;
+                        a_seg[4 * q + 2] = v.z;
+                        a_seg[4 * q + 3] = v.w;
+                    }
+                }
+            }
+            barrier();
+
+            vec4 blo[NUM_COLS];
+            vec4 bhi[NUM_COLS];
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint bi = (j*p.batch_stride_b + b_offset) / 4 + s * 128 + blk * 8 + k;
+                blo[j] = vec4(data_b_v4[bi]);
+                bhi[j] = vec4(data_b_v4[bi + 4]);
+            }
+
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    const uint o  = n * 288 + blk * 18; // byte offset of the block, always even
+                    const uint dd = a_seg[o / 4];
+                    const FLOAT_TYPE d = FLOAT_TYPE(unpackHalf2x16((o & 2) != 0 ? (dd >> 16) : dd).x);
+                    const uint qo = o + 2 + 4 * k;
+                    const uint qd = qo / 4;
+                    const uint w  = (qo & 2) != 0 ? ((a_seg[qd] >> 16) | (a_seg[qd + 1] << 16)) : a_seg[qd];
+                    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                        temp[j][n] = fma(d, dot8(w, blo[j], bhi[j]), temp[j][n]);
+                    }
+                }
+            }
+        }
+    } else {
+        for (uint i = tid; i < num_blocks_per_row; i += gl_WorkGroupSize.x) {
+            calc_block(a_offset, b_offset, i, num_blocks_per_row, first_row, num_rows);
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    init_iq_shmem(gl_WorkGroupSize);
+
+    // do NUM_ROWS at a time, unless there aren't enough remaining rows
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

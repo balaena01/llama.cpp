@@ -1,0 +1,13 @@
+[Unit]
+Description=llama-server (SenseNova-Loop-9B on PS4 GPU)
+After=network-online.target
+
+[Service]
+Environment=GGML_VK_SUBALLOCATION_BLOCK_SIZE=268435456
+WorkingDirectory=%h/llm/llama.cpp-sn
+ExecStart=%h/llm/llama.cpp-sn/build/bin/llama-server -m %h/llm/models/SenseNova-Loop-9B-IQ4_NL-ps4c.gguf --no-host -ngl 99 -fa off -c 4096 -np 1 -b 512 -ub 256 --cache-ram 0 --ctx-checkpoints 2 -t 8 --host 0.0.0.0 --port 8080 --path %h/llm/demo
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

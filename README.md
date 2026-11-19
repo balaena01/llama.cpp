@@ -1,3 +1,5 @@
+> **This branch: SenseNova-Loop-9B on a PlayStation 4 GPU (Vulkan), 9.2 tok/s.** See [ps4/README.md](ps4/README.md).
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
