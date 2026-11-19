@@ -14,6 +14,7 @@
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
 layout(constant_id = 1) const uint HAS_COMB = 1;
+layout(constant_id = 2) const uint hc = 4;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -45,8 +46,6 @@ layout(binding = 2, std430) readonly buffer P { float data_p[]; };
 layout(binding = 3, std430) readonly buffer C { float data_c[]; };
 layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
 
-const uint hc = 4;
-
 shared float post_s[hc];
 shared float comb_s[hc * hc];
 
@@ -59,8 +58,8 @@ void main() {
         post_s[tid] = gate != 0 ? (1.0f / (1.0f + exp(-(p * gate_scale_in)))) * gate_scale_out : p;
     }
     if (HAS_COMB == 1 && tid < hc * hc) {
-        const uint idst = tid & 3;
-        const uint isrc = tid >> 2;
+        const uint idst = tid % hc;
+        const uint isrc = tid / hc;
         comb_s[tid] = data_c[c_offset + idst * nbc0 + isrc * nbc1 + it * nbc2];
     }
     barrier();

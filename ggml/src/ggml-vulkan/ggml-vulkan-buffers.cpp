@@ -221,8 +221,19 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     vk_buffer buf;
     try {
         if (device->prefer_host_memory) {
-            buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                       vk::MemoryPropertyFlagBits::eDeviceLocal});
+            if (device->vram_first_left.load() >= (int64_t) size) {
+                try {
+                    buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+                    buf->vram_first = true;
+                    device->vram_first_left.fetch_sub((int64_t) size);
+                } catch (const vk::SystemError &) {
+                    buf = nullptr;
+                }
+            }
+            if (!buf) {
+                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                                                           vk::MemoryPropertyFlagBits::eDeviceLocal});
+            }
         } else if (device->uma) {
             // On UMA, prefer host-visible memory so direct tensor borrowing works.
             // If unavailable, fall back to device-local memory.

@@ -1097,6 +1097,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "MHC_ROUTE",
 
     "UNARY",
 
@@ -1114,7 +1115,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1210,6 +1211,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "mhc_route(logits)",
 
     "unary(x)",
 
@@ -1227,7 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6541,6 +6543,59 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_mhc_route
+
+struct ggml_tensor * ggml_mhc_route(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        float                 post_scale,
+        int32_t               n_iter) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(logits->ne[0] == 8);
+    GGML_ASSERT(logits->ne[2] == 1);
+    GGML_ASSERT(logits->ne[3] == 1);
+    GGML_ASSERT(n_iter >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, logits->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, post_scale);
+    ggml_set_op_params_i32(result, 1, n_iter);
+
+    result->op     = GGML_OP_MHC_ROUTE;
+    result->src[0] = logits;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mhc_route_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * b,
+        float                 eps,
+        float                 post_scale,
+        int32_t               n_iter) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->ne[0] == x->ne[0] && w->ne[1] == 8 && w->ne[2] == 1 && w->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(b) == 8);
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && w->nb[0] == sizeof(float) && ggml_is_contiguous(b));
+    GGML_ASSERT(n_iter >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, x->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, post_scale);
+    ggml_set_op_params_i32(result, 1, n_iter);
+    ggml_set_op_params_f32(result, 2, eps);
+
+    result->op     = GGML_OP_MHC_ROUTE;
+    result->src[0] = x;
+    result->src[1] = w;
+    result->src[2] = b;
 
     return result;
 }

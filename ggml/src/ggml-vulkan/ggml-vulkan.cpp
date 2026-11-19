@@ -1662,7 +1662,8 @@ static vk_xe_fa_tuning_params get_xe_fa_tuning_params(const vk_device_struct * d
 
 // CM2 uses narrow tiles for 5 <= N <= 32; CM1 uses them for 9 <= N <= 32.
 static uint32_t ggml_vk_mul_mat_vec_max_cols(const vk_device & device) {
-    return device->coopmat2 && !device->disable_narrow_mul_mat ? 4u : mul_mat_vec_max_cols;
+    const uint32_t cols = device->coopmat2 && !device->disable_narrow_mul_mat ? 4u : mul_mat_vec_max_cols;
+    return device->mul_mat_vec_cols_limit ? std::min(cols, device->mul_mat_vec_cols_limit) : cols;
 }
 
 static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
@@ -3218,6 +3219,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
+    // tuning overrides for testing
+    if (const char * env = getenv("GGML_VK_DMMV_RM_STDQ")) {
+        rm_stdq = std::max(1, std::atoi(env));
+    }
+    if (const char * env = getenv("GGML_VK_DMMV_RM_KQ")) {
+        rm_kq = std::max(1, std::atoi(env));
+    }
     // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 4u : rows; };
@@ -3229,7 +3237,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         return is_rdna3_or_4 ? 4u : rows;
     };
-    uint32_t rm_iq = 2 * rm_kq;
+    uint32_t rm_iq = device->dmmv_rm_iq ? device->dmmv_rm_iq : 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic;
     // The Imagination proprietary compiler rejects the subgroup-only dequant mul_mat_vec
@@ -3960,10 +3968,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {tokens_per_workgroup, 1, 1}, { device->subgroup_size }, 1, true, true, device->subgroup_size);
     }
 
-    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0, 4 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1, 4 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1, 4 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0, 4 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_hc2_f32,    "dsv4_hc_pre_hc2_f32",    dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0, 2 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_hc2_f32,   "dsv4_hc_post_hc2_f32",   dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1, 2 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mhc_route_f32,          "mhc_route_f32",          mhc_route_f32_len,    mhc_route_f32_data,    "main", 2, sizeof(vk_op_mhc_route_push_constants),    {64, 1, 1},  {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mhc_route_fused_f32,    "mhc_route_fused_f32",    mhc_route_fused_f32_len, mhc_route_fused_f32_data, "main", 4, sizeof(vk_op_mhc_route_fused_push_constants), {1, 1, 1}, { 256 }, 1);
 
     const uint32_t top_k_mask_wg = std::min({256u, device->properties.limits.maxComputeWorkGroupInvocations, device->properties.limits.maxComputeWorkGroupSize[0]});
     ggml_vk_create_pipeline(device, device->pipeline_top_k_mask_f16, "top_k_mask_f16", top_k_mask_f16_len, top_k_mask_f16_data, "main", 6, sizeof(vk_op_top_k_mask_push_constants), {1, 1, 1}, {top_k_mask_wg}, 1);
@@ -4580,6 +4592,50 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->properties = props2.properties;
         device->vendor_id = device->properties.vendorID;
         device->driver_id = driver_props.driverID;
+
+        // PS4 GPUs (GFX7) hang in mul_mat_vec when rows x cols per workgroup goes above 16
+        device->mul_mat_vec_cols_limit = 0;
+        {
+            const std::string dev_name = device->properties.deviceName.data();
+            if (dev_name.find("Liverpool") != std::string::npos || dev_name.find("Gladius") != std::string::npos ||
+                dev_name.find("LIVERPOOL") != std::string::npos || dev_name.find("GLADIUS") != std::string::npos) {
+                device->mul_mat_vec_cols_limit = 2;
+                // device-local BOs that spill out of the small VRAM carve-out are slow, uncached GTT is fast
+                device->prefer_host_memory = true;
+            }
+            device->dmmv_rm_iq = 0;
+            if (device->mul_mat_vec_cols_limit == 2) {
+                // fastest IQ4_NL matvec on the PS4 GPU
+                device->dmmv_rm_iq = 4;
+            }
+            if (const char * env = getenv("GGML_VK_DMMV_RM_IQ")) {
+                device->dmmv_rm_iq = std::max(1, std::atoi(env));
+            }
+            // fill the VRAM carve-out first, keep a margin for the display and the driver
+            int64_t vram_first = 0;
+            if (device->mul_mat_vec_cols_limit == 2) {
+                if (FILE * f = fopen("/sys/class/drm/renderD128/device/mem_info_vram_total", "r")) {
+                    unsigned long long vram_total = 0;
+                    if (fscanf(f, "%llu", &vram_total) == 1) {
+                        vram_first = (int64_t) vram_total - 192ll*1024*1024;
+                    }
+                    fclose(f);
+                }
+            }
+            if (const char * env = getenv("GGML_VK_VRAM_FIRST_MB")) {
+                vram_first = std::atoll(env) * 1024ll * 1024ll;
+            }
+            device->vram_first_left = std::max<int64_t>(0, vram_first);
+            const char * GGML_VK_MUL_MAT_VEC_MAX_COLS = getenv("GGML_VK_MUL_MAT_VEC_MAX_COLS");
+            if (GGML_VK_MUL_MAT_VEC_MAX_COLS != nullptr) {
+                device->mul_mat_vec_cols_limit = std::min<uint32_t>(std::stoul(GGML_VK_MUL_MAT_VEC_MAX_COLS), mul_mat_vec_max_cols);
+            }
+            // 0: subgroup-size workgroups, 1: large workgroups
+            device->dmmv_wg_override = -1;
+            if (const char * env = getenv("GGML_VK_DMMV_WG")) {
+                device->dmmv_wg_override = std::atoi(env) != 0 ? 1 : 0;
+            }
+        }
 
         device->external_memory_host = device->external_memory_host && ggml_vk_external_memory_host_usable(device->driver_id);
 
@@ -6055,6 +6111,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
+    }
+
+    if (ctx->device->dmmv_wg_override >= 0) {
+        dmmv_wg = ctx->device->dmmv_wg_override ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;
     }
 
     if (b_type == GGML_TYPE_Q8_1) {
@@ -7703,6 +7763,10 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
     vk_pipeline pipeline = gated ? ctx->device->pipeline_dsv4_hc_pre_gated_f32 : ctx->device->pipeline_dsv4_hc_pre_f32;
+    if (x->ne[1] == 2) {
+        GGML_ASSERT(!gated);
+        pipeline = ctx->device->pipeline_dsv4_hc_pre_hc2_f32;
+    }
     GGML_ASSERT(pipeline != nullptr);
 
     const uint32_t n_embd   = (uint32_t)x->ne[0];
@@ -7731,6 +7795,10 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     VK_LOG_DEBUG("ggml_vk_dsv4_hc_post(" << x << ", " << residual << ", " << post << ", " << comb << ", " << dst << ")");
 
     vk_pipeline pipeline = comb ? ctx->device->pipeline_dsv4_hc_post_f32 : ctx->device->pipeline_dsv4_hc_post_nocomb_f32;
+    if (residual->ne[1] == 2) {
+        GGML_ASSERT(comb != nullptr);
+        pipeline = ctx->device->pipeline_dsv4_hc_post_hc2_f32;
+    }
     GGML_ASSERT(pipeline != nullptr);
 
     const uint32_t n_embd   = (uint32_t)x->ne[0];
@@ -7761,6 +7829,70 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     init_pushconst_tensor_offsets(ctx, pc, x, residual, p_src, comb, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+}
+
+void ggml_vk_mhc_route(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * logits, ggml_tensor * dst) {
+    VK_LOG_DEBUG("ggml_vk_mhc_route(" << logits << ", " << dst << ")");
+
+    if (dst->src[1] != nullptr) {
+        // router folded in: src0 is x, src1 is w, src2 is b
+        const ggml_tensor * x = dst->src[0];
+        const ggml_tensor * w = dst->src[1];
+        const ggml_tensor * b = dst->src[2];
+
+        vk_pipeline pipeline = ctx->device->pipeline_mhc_route_fused_f32;
+        GGML_ASSERT(pipeline != nullptr);
+
+        const uint32_t n_tokens = (uint32_t)x->ne[1];
+
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+        const vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x,   true);
+        const vk_subbuffer w_buf = ggml_vk_tensor_subbuffer(ctx, w,   true);
+        const vk_subbuffer b_buf = ggml_vk_tensor_subbuffer(ctx, b,   true);
+        const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+        vk_op_mhc_route_fused_push_constants pc = {
+            (uint32_t)x->ne[0],
+            (uint32_t)ggml_get_op_params_i32(dst, 1),
+            0,
+            ggml_vk_nb_elem(x, 1),
+            ggml_vk_nb_elem(w, 1),
+            ggml_vk_nb_elem(dst, 0), ggml_vk_nb_elem(dst, 1),
+            get_misalign_bytes(ctx, x)   / ggml_type_size(x->type),
+            get_misalign_bytes(ctx, w)   / ggml_type_size(w->type),
+            get_misalign_bytes(ctx, b)   / ggml_type_size(b->type),
+            get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type),
+            ggml_get_op_params_f32(dst, 2),
+            ggml_get_op_params_f32(dst, 0),
+        };
+        pc.vec4_ok = (pc.K % 4 == 0 && pc.nbx1 % 4 == 0 && pc.nbw1 % 4 == 0 && pc.x_offset % 4 == 0 && pc.w_offset % 4 == 0) ? 1 : 0;
+
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, b_buf, d_buf }, pc, { n_tokens, 1, 1 });
+        return;
+    }
+
+    vk_pipeline pipeline = ctx->device->pipeline_mhc_route_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    const uint32_t n_tokens = (uint32_t)logits->ne[1];
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer s_buf = ggml_vk_tensor_subbuffer(ctx, logits, true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,    true);
+
+    vk_op_mhc_route_push_constants pc = {
+        n_tokens,
+        (uint32_t)ggml_get_op_params_i32(dst, 1),
+        ggml_vk_nb_elem(logits, 0), ggml_vk_nb_elem(logits, 1),
+        ggml_vk_nb_elem(dst, 0), ggml_vk_nb_elem(dst, 1),
+        0, 0,
+        ggml_get_op_params_f32(dst, 0),
+    };
+    init_pushconst_tensor_offsets(ctx, pc, logits, nullptr, nullptr, nullptr, dst);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { s_buf, d_buf }, pc, { n_tokens, 1, 1 });
 }
 
 void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -13379,6 +13511,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_dsv4_hc_post(ctx, compute_ctx, src0, src1, src2, src3, node);
 
         break;
+    case GGML_OP_MHC_ROUTE:
+        ggml_vk_mhc_route(ctx, compute_ctx, src0, node);
+
+        break;
     case GGML_OP_MEAN:
         ggml_vk_mean(ctx, compute_ctx, src0, node);
 
@@ -16293,7 +16429,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     }
                 }
                 if (ggml_prec_get_src(op, 1) == GGML_PREC_BF16 || ggml_prec_get_src(op, 1) == GGML_PREC_F32) {
-                    return false;
+                    // without fp16 an F32 x F32 product keeps src1 in F32
+                    const bool f32_kept = ggml_prec_get_src(op, 1) == GGML_PREC_F32 && !device->fp16 &&
+                                          src0_type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+                    if (!f32_kept) {
+                        return false;
+                    }
                 }
                 switch (src0_type) {
                     case GGML_TYPE_F32:
@@ -16660,19 +16801,31 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
-                // hc is hardcoded to 4 in the shaders. ggml only constrains it
-                // to 4 for COMB, so PRE/POST have to be checked here.
-                if (op->op == GGML_OP_DSV4_HC_PRE && op->src[0]->ne[1] != 4) {
-                    return false;
+                // PRE/POST have pipelines for hc 4 and hc 2 (hc 2: no gate, needs comb)
+                if (op->op == GGML_OP_DSV4_HC_PRE) {
+                    const int64_t hc = op->src[0]->ne[1];
+                    const bool gated = ggml_get_op_params_i32(op, 1) != 0;
+                    if (hc != 4 && !(hc == 2 && !gated)) {
+                        return false;
+                    }
                 }
-                if (op->op == GGML_OP_DSV4_HC_POST && op->src[1]->ne[1] != 4) {
-                    return false;
+                if (op->op == GGML_OP_DSV4_HC_POST) {
+                    const int64_t hc = op->src[1]->ne[1];
+                    if (hc != 4 && !(hc == 2 && op->src[3] != nullptr)) {
+                        return false;
+                    }
                 }
                 if (op->op == GGML_OP_DSV4_HC_COMB) {
                     return device->pipeline_dsv4_hc_comb_f32 != nullptr;
                 }
                 return true;
             }
+        case GGML_OP_MHC_ROUTE:
+            if (op->src[1] != nullptr) {
+                return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32;
+            }
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOLVE_TRI:
             {
                 if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32) {

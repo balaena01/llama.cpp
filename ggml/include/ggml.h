@@ -413,6 +413,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_MHC_ROUTE,
 
         GGML_OP_UNARY,
 
@@ -2517,6 +2518,29 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // SenseNova mHC route for 2 streams
+    // logits: [8, n_tokens] = [pre0, pre1, post0, post1, m00, m01, m10, m11] with m[dst][src]
+    // res:    [8, n_tokens] = [sigmoid(pre), post_scale*sigmoid(post), comb]
+    // comb[dst + 2*src] = exp(m[dst][src]) after n_iter log-domain Sinkhorn steps (src pairs first, then dst pairs)
+    // pre, post and comb views of res fit ggml_dsv4_hc_pre and ggml_dsv4_hc_post
+    //
+    GGML_API struct ggml_tensor * ggml_mhc_route(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            float                 post_scale,
+            int32_t               n_iter);
+
+    // same route, with the router folded in: logits = mul_mat(w, rms_norm(x, eps)) + b
+    // x: [K, n_tokens], w: [K, 8], b: [8]
+    GGML_API struct ggml_tensor * ggml_mhc_route_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * b,
+            float                 eps,
+            float                 post_scale,
+            int32_t               n_iter);
 
     // custom operators
 

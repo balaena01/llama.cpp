@@ -4786,6 +4786,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    identity;
     const bool    gated;
+    const int64_t n_hc;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4793,32 +4794,32 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        return VARS_TO_STR5(n_embd, n_tokens, identity, gated, n_hc);
     }
 
     // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
     bool run_whole_graph() override { return gated; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false, int64_t n_hc = hc)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), n_hc(n_hc) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_name(x, "x");
 
-        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
         ggml_set_name(residual, "residual");
 
-        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_tokens);
         ggml_set_name(post, "post");
 
         if (gated) {
-            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) n_hc)), 2.0f);
         }
 
         ggml_tensor * comb = nullptr;
         if (!identity) {
-            comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+            comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_hc, n_hc, n_tokens);
             ggml_set_name(comb, "comb");
         }
 
@@ -4828,6 +4829,81 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+
+// GGML_OP_MHC_ROUTE
+struct test_mhc_route : public test_case {
+    const int64_t n_tokens;
+    const int32_t n_iter;
+    const float   range;
+    const bool    view;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_tokens, n_iter, range, view);
+    }
+
+    test_mhc_route(int64_t n_tokens = 17, int32_t n_iter = 20, float range = 4.0f, bool view = false)
+        : n_tokens(n_tokens), n_iter(n_iter), range(range), view(view) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -range, range);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, view ? 11 : 8, n_tokens);
+        ggml_set_name(logits, "logits");
+        if (view) {
+            logits = ggml_view_2d(ctx, logits, 8, n_tokens, logits->nb[1], 3*sizeof(float));
+        }
+
+        ggml_tensor * out = ggml_mhc_route(ctx, logits, 2.0f, n_iter);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+
+// GGML_OP_MHC_ROUTE with the router folded in
+struct test_mhc_route_ext : public test_case {
+    const int64_t K;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MHC_ROUTE_EXT";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(K, n_tokens);
+    }
+
+    test_mhc_route_ext(int64_t K = 512, int64_t n_tokens = 7) : K(K), n_tokens(n_tokens) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "w") {
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 8);
+        ggml_set_name(w, "w");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mhc_route_ext(ctx, x, w, b, 1e-6f, 2.0f, 20);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -10689,6 +10765,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
+    test_cases.emplace_back(new test_dsv4_hc_pre(1, 2, 1));
+    test_cases.emplace_back(new test_dsv4_hc_pre(4096, 2, 21));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, false, 2));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, false, false, 2));
+    test_cases.emplace_back(new test_mhc_route(1));
+    test_cases.emplace_back(new test_mhc_route(17));
+    test_cases.emplace_back(new test_mhc_route(257, 20, 30.0f));
+    test_cases.emplace_back(new test_mhc_route(33, 3, 4.0f, true));
+    test_cases.emplace_back(new test_mhc_route_ext(512, 1));
+    test_cases.emplace_back(new test_mhc_route_ext(8192, 1));
+    test_cases.emplace_back(new test_mhc_route_ext(8192, 7));
+    test_cases.emplace_back(new test_mhc_route_ext(1026, 3));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
@@ -13798,6 +13886,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
         }
+    }
+
+    // cache resident matvec: a small A reused by 64 broadcast batches
+    for (ggml_type t : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, 1, 512, {1, 1}, {64, 1}));
     }
 
     for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 24, 25, 32, 33}) {

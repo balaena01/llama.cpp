@@ -1,0 +1,80 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// SenseNova mHC route for 2 streams, one invocation per token:
+//
+//   src: [pre0, pre1, post0, post1, m00, m01, m10, m11] with m[dst][src]
+//   dst: [sigmoid(pre), post_scale*sigmoid(post), comb], comb[dst + 2*src] = exp(m[dst][src])
+//
+// The Sinkhorn steps match the unfused graph up to rounding.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_tokens;
+    uint n_iter;
+
+    uint nbs0; uint nbs1;
+    uint nbd0; uint nbd1;
+
+    uint s_offset;
+    uint d_offset;
+
+    float post_scale;
+};
+
+layout(binding = 0, std430) readonly buffer S { float data_s[]; };
+layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+
+float softplus(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+float sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+// -softplus(d) == -softplus(-d) - d, so one softplus per pair
+void normalize_pair(inout float x, inout float y) {
+    const float delta = x - y;
+    x = -softplus(-delta);
+    y = x - delta;
+}
+
+void main() {
+    const uint it = gl_GlobalInvocationID.x;
+    if (it >= n_tokens) {
+        return;
+    }
+
+    const uint sb = s_offset + it * nbs1;
+
+    float l[8];
+    [[unroll]]
+    for (uint i = 0; i < 8; ++i) {
+        l[i] = data_s[sb + i * nbs0];
+    }
+
+    float m00 = l[4];
+    float m01 = l[5];
+    float m10 = l[6];
+    float m11 = l[7];
+    for (uint i = 0; i < n_iter; ++i) {
+        normalize_pair(m00, m01);
+        normalize_pair(m10, m11);
+        normalize_pair(m00, m10);
+        normalize_pair(m01, m11);
+    }
+
+    const uint db = d_offset + it * nbd1;
+    data_d[db + 0 * nbd0] = sigmoid(l[0]);
+    data_d[db + 1 * nbd0] = sigmoid(l[1]);
+    data_d[db + 2 * nbd0] = sigmoid(l[2]) * post_scale;
+    data_d[db + 3 * nbd0] = sigmoid(l[3]) * post_scale;
+    data_d[db + 4 * nbd0] = exp(m00);
+    data_d[db + 5 * nbd0] = exp(m10);
+    data_d[db + 6 * nbd0] = exp(m01);
+    data_d[db + 7 * nbd0] = exp(m11);
+}

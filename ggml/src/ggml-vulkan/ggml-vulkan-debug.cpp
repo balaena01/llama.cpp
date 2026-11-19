@@ -1253,6 +1253,12 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             }
         } else if (tensor->op == GGML_OP_DSV4_HC_POST) {
             tensor_clone = ggml_dsv4_hc_post(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
+        } else if (tensor->op == GGML_OP_MHC_ROUTE) {
+            if (tensor->src[1] != nullptr) {
+                tensor_clone = ggml_mhc_route_ext(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], ggml_get_op_params_f32(tensor, 2), ggml_get_op_params_f32(tensor, 0), ggml_get_op_params_i32(tensor, 1));
+            } else {
+                tensor_clone = ggml_mhc_route(ggml_ctx, src_clone[0], ggml_get_op_params_f32(tensor, 0), ggml_get_op_params_i32(tensor, 1));
+            }
         } else if (tensor->op == GGML_OP_MEAN) {
             tensor_clone = ggml_mean(ggml_ctx, src_clone[0]);
         } else if (tensor->op == GGML_OP_ARGMAX) {

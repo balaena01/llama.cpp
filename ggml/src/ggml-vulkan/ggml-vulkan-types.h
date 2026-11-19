@@ -979,6 +979,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+    vk_pipeline pipeline_dsv4_hc_pre_hc2_f32;
+    vk_pipeline pipeline_dsv4_hc_post_hc2_f32;
+    vk_pipeline pipeline_mhc_route_f32;
+    vk_pipeline pipeline_mhc_route_fused_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
@@ -1052,6 +1056,11 @@ struct vk_device_struct {
     bool disable_graph_optimize;
     bool xe_fa_support {};
     bool disable_narrow_mul_mat;
+    uint32_t mul_mat_vec_cols_limit;
+    int32_t dmmv_wg_override;
+    uint32_t dmmv_rm_iq;
+    // with prefer_host_memory, bytes that may still go to VRAM first (fills the VRAM carve-out of UMA devices)
+    std::atomic<int64_t> vram_first_left {0};
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
@@ -1082,6 +1091,7 @@ struct vk_buffer_struct {
     void * ptr;
     size_t size = 0;
     vk::DeviceAddress bda_addr {};
+    bool vram_first = false;
 
     vk_device device;
 
@@ -1090,6 +1100,10 @@ struct vk_buffer_struct {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+
+        if (vram_first) {
+            device->vram_first_left.fetch_add((int64_t) size);
+        }
 
         // bump before destroying, so a thread that sees the buffer gone also sees the new count
         device->buffer_destroy_count.fetch_add(1, std::memory_order_release);

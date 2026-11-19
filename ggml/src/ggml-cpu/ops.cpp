@@ -11573,6 +11573,100 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// ggml_compute_forward_mhc_route
+
+static inline float mhc_softplus(float x) {
+    return (x > 20.0f) ? x : log1pf(expf(x));
+}
+
+static inline float mhc_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// two-element log-softmax: d = x - y, x = -softplus(-d), y = -softplus(d) = x - d
+static inline void mhc_normalize(float & x, float & y) {
+    const float d = x - y;
+    x = -mhc_softplus(-d);
+    y = x - d;
+}
+
+void ggml_compute_forward_mhc_route(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * b = dst->src[2];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT((w != nullptr || src0->ne[0] == 8) && dst->ne[0] == 8);
+
+    const float   post_scale = ggml_get_op_params_f32(dst, 0);
+    const int32_t n_iter     = ggml_get_op_params_i32(dst, 1);
+    const float   eps        = w ? ggml_get_op_params_f32(dst, 2) : 0.0f;
+
+    const int64_t n_tokens = src0->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (n_tokens + nth - 1) / nth;
+    const int64_t it0 = dr * ith;
+    const int64_t it1 = MIN(it0 + dr, n_tokens);
+
+    for (int64_t it = it0; it < it1; ++it) {
+        float l[8];
+        if (w) {
+            // router: mul_mat(w, rms_norm(x)) + b
+            const int64_t K = src0->ne[0];
+            const float * x = (const float *) ((const char *) src0->data + it*src0->nb[1]);
+            ggml_float sum = 0.0;
+            for (int64_t k = 0; k < K; ++k) {
+                sum += (ggml_float) x[k] * (ggml_float) x[k];
+            }
+            const float scale = 1.0f / sqrtf((float) (sum / K) + eps);
+            for (int r = 0; r < 8; ++r) {
+                const float * wr = (const float *) ((const char *) w->data + r*w->nb[1]);
+                ggml_float dot = 0.0;
+                for (int64_t k = 0; k < K; ++k) {
+                    dot += (ggml_float) wr[k] * (ggml_float) x[k];
+                }
+                l[r] = (float) dot * scale + ((const float *) b->data)[r];
+            }
+        } else {
+            for (int i = 0; i < 8; ++i) {
+                l[i] = *(const float *) ((const char *) src0->data + i*src0->nb[0] + it*src0->nb[1]);
+            }
+        }
+
+        float m00 = l[4];
+        float m01 = l[5];
+        float m10 = l[6];
+        float m11 = l[7];
+        for (int32_t i = 0; i < n_iter; ++i) {
+            mhc_normalize(m00, m01);
+            mhc_normalize(m10, m11);
+            mhc_normalize(m00, m10);
+            mhc_normalize(m01, m11);
+        }
+
+        const float out[8] = {
+            mhc_sigmoid(l[0]),
+            mhc_sigmoid(l[1]),
+            mhc_sigmoid(l[2]) * post_scale,
+            mhc_sigmoid(l[3]) * post_scale,
+            expf(m00),
+            expf(m10),
+            expf(m01),
+            expf(m11),
+        };
+        for (int i = 0; i < 8; ++i) {
+            *(float *) ((char *) dst->data + i*dst->nb[0] + it*dst->nb[1]) = out[i];
+        }
+    }
+}
+
 // ggml_compute_forward_top_k_mask
 
 void ggml_compute_forward_top_k_mask(

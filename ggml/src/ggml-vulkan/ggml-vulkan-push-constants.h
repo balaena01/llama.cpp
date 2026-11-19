@@ -242,6 +242,37 @@ struct vk_op_top_k_mask_push_constants {
     uint32_t d_offset;
 };
 
+struct vk_op_mhc_route_push_constants {
+    uint32_t n_tokens;
+    uint32_t n_iter;
+
+    uint32_t nbs0; uint32_t nbs1;
+    uint32_t nbd0; uint32_t nbd1;
+
+    uint32_t s_offset;
+    uint32_t d_offset;
+
+    float post_scale;
+};
+
+struct vk_op_mhc_route_fused_push_constants {
+    uint32_t K;
+    uint32_t n_iter;
+    uint32_t vec4_ok;
+
+    uint32_t nbx1;
+    uint32_t nbw1;
+    uint32_t nbd0; uint32_t nbd1;
+
+    uint32_t x_offset;
+    uint32_t w_offset;
+    uint32_t b_offset;
+    uint32_t d_offset;
+
+    float eps;
+    float post_scale;
+};
+
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
     uint32_t ne01;
@@ -975,6 +1006,15 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
     p.b_offset = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
     p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
 
+    GGML_UNUSED(src3);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_mhc_route_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.s_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+
+    GGML_UNUSED(src1);
+    GGML_UNUSED(src2);
     GGML_UNUSED(src3);
 }
 
